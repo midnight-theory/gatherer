@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const ora = require('ora');
+const path = require('path');
+const chalk = require('chalk');
+const boxen = require('boxen');
+const prompt = require('prompt');
+const rimraf = require('rimraf');
+const program = require('commander');
+const prettyjson = require('prettyjson-256');
+const package = require('../package.json');
+const gatherer = require('../index.js');
+
+program
+  .version(package.version)
+
+program
+  .option('-c, --config <file>', 'path to gatherer config file')
+
+program
+  .parse(process.argv)
+
+const itemCounts = {
+  'Files Written': 0,
+  'Invalid status': 0,
+  'No metadata': 0,
+  'No URL': 0
+};
+
+let prompts = [{
+  name: 'username',
+  description: 'Username',
+  type: 'string',
+  required: true,
+  message: 'Please enter your GatherContent username.'
+}, {
+  name: 'password',
+  description: 'API Key',
+  type: 'string',
+  required: true,
+  message: 'Please enter your GatherContent API key.'
+}, {
+  name: 'project',
+  description: 'Project ID',
+  type: 'string',
+  required: true,
+  message: 'You must specify a valid Project ID.'
+}, {
+  name: 'pages',
+  description: 'Pages output path',
+  type: 'string',
+  required: true,
+  message: 'You must specify an output path for pages data.'
+}];
+
+let config;
+let configFile;
+
+// Try to load config file from `-c` flag
+if (program.config) configFile = path.resolve('./', program.config);
+if (fs.existsSync(configFile)) config = require(configFile);
+
+// If no config file is loaded from flag, try to load from `./gatherer.json`
+const defaultConfigFile = path.join(process.cwd(), 'gatherer.json');
+if (!config && fs.existsSync(defaultConfigFile)) {
+  config = require(defaultConfigFile);
+}
+
+// If config file is found, remove the redundant prompts
+if (config) prompts = prompts.filter(obj => {
+  return !Object.keys(config).includes(obj.name);
+});
+
+// Prompt user for input
+prompt.start();
+prompt.message = chalk.green('[?]');
+prompt.get(prompts, async (err, prompted) => {
+  if (err) throw err;
+
+  const outputPaths = {
+    pages: config.pages || prompted.pages,
+    entries: config.entries || prompted.entries
+  };
+
+  const projectId = config.project || prompted.project;
+  const auth = {
+    username: config.username || prompted.username,
+    password: config.password || prompted.password
+  }
+
+  // Print newline and init CLI spinner
+  console.log();
+  const spinner = ora('Finding items to fetch').start();
+
+  try {
+    let listObj = await gatherer.fetch({
+      type: 'items',
+      id: projectId,
+      auth
+    });
+    let items = [...listObj.data.data];
+    const {
+      total_pages,
+      current_page
+    } = listObj.data.pagination;
+    if (total_pages > current_page) {
+      for (let i = current_page; i < total_pages; i++) {
+        const {
+          next
+        } = listObj.data.pagination.links;
+        listObj = await gatherer.fetch({
+          endpoint: next,
+          auth,
+        });
+        items = [...items, ...listObj.data.data];
+      }
+    }
+    spinner.succeed(`Found ${chalk.cyan(items.length)} items`);
+
+
+    /**
+     * Get folders
+     */
+    spinner.start(`Start fetching total folders`);
+    const folders = await gatherer.fetch({
+      type: 'folders',
+      id: projectId,
+      auth
+    });
+    const foldersData = folders.data.data;
+    spinner.succeed(`Organized for ${chalk.cyan(foldersData.length)} folders`);
+
+
+    /**
+     * Get statuses
+     */
+    spinner.start(`Start fetching all statuses`);
+    const statuses = await gatherer.fetch({
+      type: 'statuses',
+      id: projectId,
+      auth,
+      headers: {},
+    });
+    const statusData = statuses.data.data;
+    spinner.succeed(`Found ${chalk.cyan(statusData.length)} statuses`);
+
+
+    /**
+     * Fetch data for all items
+     */
+    spinner.start(`Fetching item data`);
+    let dataFetchedCount = 0; // Number of items that have been fetched
+    // Build an array of Promises that each resolve with fetched data
+    const itemRequests = [];
+    for (let i = 0; i < items.length; i++) {
+      const res = await gatherer.fetch({
+        type: 'item',
+        id: items[i].id,
+        auth
+      });
+      const {
+        data
+      } = res.data;
+      dataFetchedCount++;
+      spinner.text = `Fetched data for [${chalk.cyan(dataFetchedCount)}/${chalk.cyan(items.length)}] items`;
+      itemRequests.push(gatherer.transform({
+        item: data,
+        statuses: statusData,
+      }));
+    }
+    spinner.succeed(`Fetched data for ${chalk.cyan(itemRequests.length)} items`);
+
+
+    /**
+     * Next folder structure
+     */
+    const structuredPages = await gatherer.nest({
+      items: [...foldersData, ...itemRequests],
+      id: 'uuid',
+      parent: 'parent_uuid',
+    });
+
+    /**
+     * Write files
+     */
+    rimraf(outputPaths.pages, err => {
+      if (err) console.error(err);
+
+      gatherer.writePages(structuredPages, outputPaths.pages)
+        .then(result => {
+          spinner.succeed(`Page data written`);
+          console.log(boxen(
+            prettyjson.render(result), {
+              padding: 2,
+              margin: 0,
+              borderStyle: 'double'
+            }
+          ));
+        });
+    });
+
+  } catch (err) {
+    spinner.fail(err.message);
+  }
+});
