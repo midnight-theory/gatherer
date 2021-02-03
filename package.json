@@ -1,5 +1,5 @@
 {
-  "name": "gatherer",
+  "name": "@midnight-theory/gatherer",
   "version": "0.1.0",
   "main": "index.js",
   "author": {
